@@ -64,7 +64,7 @@ from diffusers.pipelines.stable_diffusion_xl import (
     StableDiffusionXLPipeline,
 )
 
-
+import numpy as np
 # if is_invisible_watermark_available():
 #     from .watermark import StableDiffusionXLWatermarker
 
@@ -704,6 +704,9 @@ class FKDStableDiffusionXL(
                 **fkd_args,
             )
 
+        safe_denoise_steps = np.arange(
+            fkd_args['safe_denoise_t_start'], fkd_args['safe_denoise_t_end']+1,
+        )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -765,6 +768,7 @@ class FKDStableDiffusionXL(
                 # FK Steering Change
                 latents = step_dict['prev_sample']
                 x0_preds = step_dict['pred_original_sample']
+                image = self.vae.decode(latents, return_dict=False)[0]
 
                 # FK Steering Change
                 if fkd_args is not None and fkd_args['use_smc']:
@@ -818,6 +822,39 @@ class FKDStableDiffusionXL(
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        image = self.latents2img(
+            latents=latents,
+            output_type=output_type,
+        )
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+
+        return StableDiffusionXLPipelineOutput(images=image)
+
+
+    @torch.no_grad()
+    def latents2img(
+        self,
+        latents: torch.FloatTensor,
+        output_type: Optional[str] = "pil",
+    ):
+        """
+        Convert latents to images.
+
+        Args:
+            latents (`torch.FloatTensor`):
+                Latents to convert to images.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+
+        Returns:
+            `List[PIL.Image.Image]` or `List[np.ndarray]`:
+            List of generated images.
+        """
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16
             needs_upcasting = (
@@ -876,17 +913,7 @@ class FKDStableDiffusionXL(
                 image = self.watermark.apply_watermark(image)
 
             image = self.image_processor.postprocess(image, output_type=output_type)
-
-        # Offload all models
-        self.maybe_free_model_hooks()
-
-        if not return_dict:
-            return (image,)
-
-        return StableDiffusionXLPipelineOutput(images=image)
-
-
-                
+        return image
 # FK Steering Change
 def latent_to_decode(*, model, output_type, latents):
     if not output_type == "latent":
