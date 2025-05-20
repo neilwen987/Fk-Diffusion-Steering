@@ -1,5 +1,7 @@
 # primary generation script
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import json
 import numpy as np
 from PIL import Image
@@ -127,11 +129,11 @@ def main(args):
     metrics_to_compute = args.metrics_to_compute.split("#")
 
     # cache metric fns
-    do_eval(
-        prompt=["test"],
-        images=[Image.new("RGB", (224, 224))],
-        metrics_to_compute=metrics_to_compute,
-    )
+    # do_eval(
+    #     prompt=["test"],
+    #     images=[Image.new("RGB", (224, 224))],
+    #     metrics_to_compute=metrics_to_compute,
+    # )
 
     metrics_arr = {
         metric: dict(mean=0, max=0, min=0, std=0) for metric in metrics_to_compute
@@ -161,6 +163,16 @@ def main(args):
             resampling_t_end=args.resample_t_end,
             guidance_reward_fn=args.guidance_reward_fn,
             potential_type=args.potential_type,
+            w2s_config=dict(
+                w_model_path=args.w_model_path,
+                w_model_name=args.w_model_name,
+                use_safe=args.use_safe,
+                use_safe_noise = args.use_safe_noise,
+                safe_noise_scale=args.safe_noise_scale,
+            ),
+            save_images=True,
+            output_dir=args.output_dir,
+            seed=args.seed
         )
 
         images = pipe(
@@ -173,43 +185,43 @@ def main(args):
         if args.use_smc:
             end_time = datetime.now()
 
-        results = do_eval(
-            prompt=prompt, images=images, metrics_to_compute=metrics_to_compute
-        )
-        if not args.use_smc:
-            end_time = datetime.now()
-        time_taken = end_time - start_time
+        # results = do_eval(
+        #     prompt=prompt, images=images, metrics_to_compute=metrics_to_compute
+        # )
+        # if not args.use_smc:
+        #     end_time = datetime.now()
+        # time_taken = end_time - start_time
 
-        results["time_taken"] = time_taken.total_seconds()
-        results["prompt"] = prompt
-        results["prompt_index"] = prompt_idx
+        # results["time_taken"] = time_taken.total_seconds()
+        # results["prompt"] = prompt
+        # results["prompt_index"] = prompt_idx
 
-        n_samples += 1
+        # n_samples += 1
 
-        average_time += time_taken.total_seconds()
-        print(f"Time taken: {average_time / n_samples}")
+        # average_time += time_taken.total_seconds()
+        # print(f"Time taken: {average_time / n_samples}")
 
-        # sort images by reward
-        guidance_reward = np.array(results[args.guidance_reward_fn]["result"])
-        sorted_idx = np.argsort(guidance_reward)[::-1]
-        images = [images[i] for i in sorted_idx]
-        for metric in metrics_to_compute:
-            results[metric]["result"] = [
-                results[metric]["result"][i] for i in sorted_idx
-            ]
+        # # sort images by reward
+        # guidance_reward = np.array(results[args.guidance_reward_fn]["result"])
+        # sorted_idx = np.argsort(guidance_reward)[::-1]
+        # images = [images[i] for i in sorted_idx]
+        # for metric in metrics_to_compute:
+        #     results[metric]["result"] = [
+        #         results[metric]["result"][i] for i in sorted_idx
+        #     ]
 
-        for metric in metrics_to_compute:
-            metrics_arr[metric]["mean"] += results[metric]["mean"]
-            metrics_arr[metric]["max"] += results[metric]["max"]
-            metrics_arr[metric]["min"] += results[metric]["min"]
-            metrics_arr[metric]["std"] += results[metric]["std"]
+        # for metric in metrics_to_compute:
+        #     metrics_arr[metric]["mean"] += results[metric]["mean"]
+        #     metrics_arr[metric]["max"] += results[metric]["max"]
+        #     metrics_arr[metric]["min"] += results[metric]["min"]
+        #     metrics_arr[metric]["std"] += results[metric]["std"]
 
-        for metric in metrics_to_compute:
-            print(
-                metric,
-                metrics_arr[metric]["mean"] / n_samples,
-                metrics_arr[metric]["max"] / n_samples,
-            )
+        # for metric in metrics_to_compute:
+        #     print(
+        #         metric,
+        #         metrics_arr[metric]["mean"] / n_samples,
+        #         metrics_arr[metric]["max"] / n_samples,
+        #     )
 
         if args.save_individual_images:
             sample_path = os.path.join(prompt_path, "samples")
@@ -222,8 +234,8 @@ def main(args):
             for image_idx, image in enumerate(images[:1]):
                 image.save(os.path.join(best_of_n_sample_path, f"{image_idx:05}.png"))
 
-        with open(os.path.join(prompt_path, "results.json"), "w") as f:
-            json.dump(results, f)
+        # with open(os.path.join(prompt_path, "results.json"), "w") as f:
+            # json.dump(results, f)
 
         _, ax = plt.subplots(1, args.num_particles, figsize=(args.num_particles * 5, 5))
         for i, image in enumerate(images):
@@ -236,14 +248,14 @@ def main(args):
         plt.close()
 
     # save final metrics
-    for metric in metrics_to_compute:
-        metrics_arr[metric]["mean"] /= n_samples
-        metrics_arr[metric]["max"] /= n_samples
-        metrics_arr[metric]["min"] /= n_samples
-        metrics_arr[metric]["std"] /= n_samples
+    # for metric in metrics_to_compute:
+    #     metrics_arr[metric]["mean"] /= n_samples
+    #     metrics_arr[metric]["max"] /= n_samples
+    #     metrics_arr[metric]["min"] /= n_samples
+    #     metrics_arr[metric]["std"] /= n_samples
 
-    with open(os.path.join(output_dir, "final_metrics.json"), "w") as f:
-        json.dump(metrics_arr, f)
+    # with open(os.path.join(output_dir, "final_metrics.json"), "w") as f:
+    #     json.dump(metrics_arr, f)
 
 
 def get_args():
@@ -252,7 +264,7 @@ def get_args():
     parser.add_argument("--save_individual_images", type=bool, default=True)
     parser.add_argument("--num_particles", type=int, default=4)
     parser.add_argument("--num_inference_steps", type=int, default=100)
-    parser.add_argument("--use_smc", action="store_true")
+    parser.add_argument("--use_smc", action="store_true",default=False)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--guidance_reward_fn", type=str, default="ImageReward")
     parser.add_argument(
@@ -261,8 +273,8 @@ def get_args():
         default="ImageReward#HumanPreference",
         help="# separated list of metrics",
     )
-    parser.add_argument("--prompt_path", type=str, default="geneval_metadata.jsonl")
-    parser.add_argument("--model_idx", type=int, default=0, help="Used for selecting model and configuration")
+    parser.add_argument("--prompt_path", type=str, default="prompt_files/w2s_test.jsonl")
+    parser.add_argument("--model_idx", type=int, default=8, help="Used for selecting model and configuration")
 
     parser.add_argument(
         "--model_name", type=str, default="stabilityai/stable-diffusion-2-1"
@@ -272,8 +284,13 @@ def get_args():
     parser.add_argument("--adaptive_resampling", action="store_true")
     parser.add_argument("--resample_frequency", type=int, default=5)
     parser.add_argument("--resample_t_start", type=int, default=5)
-    parser.add_argument("--resample_t_end", type=int, default=30)
-    parser.add_argument("--potential_type", type=str, default="diff")
+    parser.add_argument("--resample_t_end", type=int, default=50)
+    parser.add_argument("--potential_type", type=str, default="max")
+    parser.add_argument("--w_model_name", type=str, default="")
+    parser.add_argument("--w_model_path", type=str, default="")
+    parser.add_argument("--use_safe", default=True)
+    parser.add_argument("--use_safe_noise", default=False)
+    parser.add_argument("--safe_noise_scale", type=float, default=0.5)
 
     args = parser.parse_args()
     print(args.adaptive_resampling)
