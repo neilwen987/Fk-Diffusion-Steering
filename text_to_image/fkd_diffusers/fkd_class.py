@@ -63,6 +63,8 @@ class FKD:
         self.adaptive_resampling = adaptive_resampling
         self.resample_frequency = resample_frequency
         self.resampling_t_start = resampling_t_start
+        self.safe_denoise_t_start = safe_denoise_t_start
+        self.safe_denoise_t_end = safe_denoise_t_end
         self.resampling_t_end = resampling_t_end
         self.time_steps = time_steps
 

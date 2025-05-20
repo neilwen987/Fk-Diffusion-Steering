@@ -233,7 +233,7 @@ class esd_w2s_StableDiffusion(
         pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
         # load ckpt for safe unet
         if unet_safe_path:
-            pipeline.unet_safe = UNet2DConditionModel.from_config(pipeline.unet.config).to(pipeline.unet.device)
+            pipeline.unet_safe = UNet2DConditionModel.from_config(pipeline.unet.config)
             pipeline.unet_safe.load_state_dict(pipeline.unet.state_dict())
             state_dict = torch.load(unet_safe_path,map_location=pipeline.unet_safe.device)
             # state_dict = {k: v.to(pipeline.unet_safe.device) for k, v in state_dict.items()}
@@ -674,14 +674,14 @@ class esd_w2s_StableDiffusion(
         return scores
 
     @torch.no_grad()
-    def score_batched(
+    def safe_denoise(
         self,
         prompt: Union[str, List[str]] = None,
         fkd_args: Optional[Dict[str, Any]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 100,
-        start_timesteps: List[int] = None,
+        start_timesteps: int = None,
         sigmas: List[float] = None,
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -693,7 +693,6 @@ class esd_w2s_StableDiffusion(
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
-        input_image: Optional[PipelineImageInput] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -711,37 +710,39 @@ class esd_w2s_StableDiffusion(
         **kwargs,
     ):
         assert isinstance(prompt, list)
-        assert isinstance(input_image, list)
-
+        self.unet_safe.to(self._execution_device)
         # 0. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
+        # height = height or self.unet.config.sample_size * self.vae_scale_factor
+        # width = width or self.unet.config.sample_size * self.vae_scale_factor
     
-        # 1. 处理输入图像
-        if input_image is not None:
-            # 转换为tensor
-            input_image = self.image_processor.preprocess(input_image)
-            device = self._execution_device
-            input_image = input_image.to(device)
-            # 调整图像大小
-            input_image = F.interpolate(
-                input_image,
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            # 转换为潜空间表示
-            latents = self.vae.encode(input_image).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-            [latents_safe, latents_regular] = torch.chunk(latents, chunks=2, dim=0)
-        else:
-            latents = None
+        # # 1. 处理输入图像
+        # if input_image is not None:
+        #     # 转换为tensor
+        #     input_image = self.image_processor.preprocess(input_image)
+        #     device = self._execution_device
+        #     input_image = input_image.to(device)
+        #     # 调整图像大小
+        #     input_image = F.interpolate(
+        #         input_image,
+        #         size=(height, width),
+        #         mode="bilinear",
+        #         align_corners=False,
+        #     )
+        #     # 转换为潜空间表示
+        #     latents = self.vae.encode(input_image).latent_dist.sample()
+        #     latents = latents * self.vae.config.scaling_factor
+        #     [latents_safe, latents_regular] = torch.chunk(latents, chunks=2, dim=0)
+        # else:
+        #     latents = None
+
+        [latents_safe, latents_regular] = torch.chunk(latents, chunks=2, dim=0)
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 2. 准备timesteps
         assert start_timesteps is not None, "timesteps  must be provided"
         # 使用retrieve_timesteps来设置timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, 
+            self.scheduler, num_inference_steps, 
         )
         
 
@@ -836,38 +837,150 @@ class esd_w2s_StableDiffusion(
         # scores = self.compute_distance_score(noise_pred_regular, noise_pred_safe)
         # print('hello')
                 # compute the previous noisy sample x_t -> x_t-1
-
         # FK Steering Change
-        extra_step_kwargs = {}
-        x0_preds_regular = self.scheduler.step(
+        step_dict_regular = self.scheduler.step(
                     noise_pred_regular, t, latents_regular, **extra_step_kwargs, return_dict=True
-                )['pred_original_sample']
-        x0_preds_safe = self.scheduler.step(
+                )
+        step_dict_safe = self.scheduler.step(
                     noise_pred_safe, t, latents_safe, **extra_step_kwargs, return_dict=True
-                )['pred_original_sample']
+                )
+        latents = torch.concat([step_dict_safe['prev_sample'],step_dict_regular['prev_sample']],dim=0)
+        x0_preds = torch.concat([step_dict_safe['pred_original_sample'],step_dict_regular['pred_original_sample']],dim=0)
 
-        # img_regular = self.image_processor.postprocess(x0_preds_regular, output_type=output_type)
-        # img_safe = self.image_processor.postprocess(x0_preds_safe, output_type=output_type)
+        return latents, x0_preds
 
-        img_regular = self.vae.decode(
-                x0_preds_regular / self.vae.config.scaling_factor,
-                return_dict=False,
-                generator=None,
-            )[0]
-        img_safe = self.vae.decode(
-            x0_preds_safe / self.vae.config.scaling_factor,
-            return_dict=False,
-            generator=None,
-        )[0]
+    @torch.no_grad()
+    def latents2img(
+        self,
+        latents: torch.FloatTensor,
+        output_type: Optional[str] = "pil",
+    ):
+        """
+        Convert latents to images.
 
-        pil_img_regular = self.image_processor.postprocess(
-            img_regular, output_type=output_type, 
+        Args:
+            latents (`torch.FloatTensor`):
+                Latents to convert to images.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+
+        Returns:
+            `List[PIL.Image.Image]` or `List[np.ndarray]`:
+            List of generated images.
+        """
+        if not output_type == "latent":
+            # make sure the VAE is in float32 mode, as it overflows in float16
+            needs_upcasting = (
+                self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+            )
+
+            if needs_upcasting:
+                self.upcast_vae()
+                latents = latents.to(
+                    next(iter(self.vae.post_quant_conv.parameters())).dtype
+                )
+            elif latents.dtype != self.vae.dtype:
+                if torch.backends.mps.is_available():
+                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                    self.vae = self.vae.to(latents.dtype)
+
+            # unscale/denormalize the latents
+            # denormalize with the mean and std if available and not None
+            has_latents_mean = (
+                hasattr(self.vae.config, "latents_mean")
+                and self.vae.config.latents_mean is not None
+            )
+            has_latents_std = (
+                hasattr(self.vae.config, "latents_std")
+                and self.vae.config.latents_std is not None
+            )
+            if has_latents_mean and has_latents_std:
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, 4, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents_std = (
+                    torch.tensor(self.vae.config.latents_std)
+                    .view(1, 4, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents = (
+                    latents * latents_std / self.vae.config.scaling_factor
+                    + latents_mean
+                )
+            else:
+                latents = latents / self.vae.config.scaling_factor
+
+            image = self.vae.decode(latents, return_dict=False)[0]
+
+            # cast back to fp16 if needed
+            if needs_upcasting:
+                self.vae.to(dtype=torch.float16)
+        else:
+            image = latents
+
+        if not output_type == "latent":
+            image = self.image_processor.postprocess(image, output_type=output_type)
+        return image
+
+
+# FK Steering Change
+def latent_to_decode(*, model, output_type, latents):
+    if not output_type == "latent":
+        # make sure the VAE is in float32 mode, as it overflows in float16
+        needs_upcasting = (
+            model.vae.dtype == torch.float16 and model.vae.config.force_upcast
         )
-        pil_img_safe = self.image_processor.postprocess(
-            img_safe, output_type=output_type, 
+
+        if needs_upcasting:
+            model.upcast_vae()
+            latents = latents.to(
+                next(iter(model.vae.post_quant_conv.parameters())).dtype
+            )
+        elif latents.dtype != model.vae.dtype:
+            if torch.backends.mps.is_available():
+                # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                model.vae = model.vae.to(latents.dtype)
+
+        # unscale/denormalize the latents
+        # denormalize with the mean and std if available and not None
+        has_latents_mean = (
+            hasattr(model.vae.config, "latents_mean")
+            and model.vae.config.latents_mean is not None
         )
-        # return torch.cat((img_regular, img_safe))
-        return [pil_img_regular, pil_img_safe]
+        has_latents_std = (
+            hasattr(model.vae.config, "latents_std")
+            and model.vae.config.latents_std is not None
+        )
+        if has_latents_mean and has_latents_std:
+            latents_mean = (
+                torch.tensor(model.vae.config.latents_mean)
+                .view(1, 4, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = (
+                torch.tensor(model.vae.config.latents_std)
+                .view(1, 4, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents = (
+                latents * latents_std / model.vae.config.scaling_factor + latents_mean
+            )
+        else:
+            latents = latents / model.vae.config.scaling_factor
+
+        image = model.vae.decode(latents, return_dict=False)[0]
+
+        # cast back to fp16 if needed
+        if needs_upcasting:
+            model.vae.to(dtype=torch.float16)
+    else:
+        image = latents
+
+    return image
+
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

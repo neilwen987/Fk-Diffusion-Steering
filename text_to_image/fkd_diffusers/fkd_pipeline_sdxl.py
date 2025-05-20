@@ -14,12 +14,13 @@
 
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+from PIL import Image
 # Added for FK Steering
 from fkd_class import FKD
 from rewards import get_reward_function
-
+from w2s_pipeline_sd import esd_w2s_StableDiffusion
 import torch
+import torch.nn.functional as F
 from transformers import (
     CLIPImageProcessor,
     CLIPTextModel,
@@ -539,6 +540,11 @@ class FKDStableDiffusionXL(
         self._denoising_end = denoising_end
         self._interrupt = False
 
+        if fkd_args['w2s_config']['use_safe']:
+            self.safe_model = esd_w2s_StableDiffusion.from_pretrained(fkd_args['w2s_config']['w_model_name'],
+                                                      unet_safe_path=fkd_args['w2s_config']['w_model_path'],torch_dtype=torch.float32)
+            # Move safe_model to the same device as the main model
+            self.safe_model = self.safe_model.to(self._execution_device)
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -548,7 +554,7 @@ class FKDStableDiffusionXL(
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
-
+        self.upcast_vae()
         # 3. Encode input prompt
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None)
@@ -711,70 +717,116 @@ class FKDStableDiffusionXL(
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+                
+                if i in safe_denoise_steps:
+                    if i == fkd_args['safe_denoise_t_start']:
+                        image_x0 = self.latents2img(
+                        latents=x0_preds,
+                        output_type=output_type,
+                        )
+                        height = self.safe_model.unet.config.sample_size * self.safe_model.vae_scale_factor
+                        width = self.safe_model.unet.config.sample_size * self.safe_model.vae_scale_factor
+                        input_image = self.safe_model.image_processor.preprocess(image_x0)
+                        # 调整图像大小
+                        input_image = F.interpolate(
+                            input_image,
+                            size=(height, width),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        latents = self.safe_model.vae.encode(input_image.to(self._execution_device)).latent_dist.sample()
+                        latents = latents * self.safe_model.vae.config.scaling_factor
+                    latents, x0_pred = self.safe_model.safe_denoise(prompt=prompt,latents = latents, start_timesteps=t,)
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2)
-                    if self.do_classifier_free_guidance
-                    else latents
-                )
-
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
-                # predict the noise residual
-                added_cond_kwargs = {
-                    "text_embeds": add_text_embeds,
-                    "time_ids": add_time_ids,
-                }
-                if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-                    added_cond_kwargs["image_embeds"] = image_embeds
-
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
-
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
+                else:
+                    if i == (fkd_args['safe_denoise_t_end']+1):
+                        image_x0 = self.safe_model.latents2img(
+                            latents = latents,
+                            output_type=output_type,)
+                        height = self.unet.config.sample_size * self.vae_scale_factor
+                        width = self.unet.config.sample_size * self.vae_scale_factor
+                        input_image = self.image_processor.preprocess(image_x0)
+                        # 调整图像大小
+                        input_image = F.interpolate(
+                            input_image,
+                            size=(height, width),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        latents = self.vae.encode(input_image.to(self._execution_device)).latent_dist.sample()
+                        latents = latents * self.vae.config.scaling_factor
+                    
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = (
+                        torch.cat([latents] * 2)
+                        if self.do_classifier_free_guidance
+                        else latents
                     )
 
-                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
-                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    noise_pred = rescale_noise_cfg(
-                        noise_pred,
-                        noise_pred_text,
-                        guidance_rescale=self.guidance_rescale,
+                    latent_model_input = self.scheduler.scale_model_input(
+                        latent_model_input, t
                     )
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
+                    # predict the noise residual
+                    added_cond_kwargs = {
+                        "text_embeds": add_text_embeds,
+                        "time_ids": add_time_ids,
+                    }
+                    if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+                        added_cond_kwargs["image_embeds"] = image_embeds
 
-                # FK Steering Change
-                # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                step_dict = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs, return_dict=True
-                )
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
 
-                # FK Steering Change
-                latents = step_dict['prev_sample']
-                x0_preds = step_dict['pred_original_sample']
-                image = self.vae.decode(latents, return_dict=False)[0]
+                    # perform guidance
+                    if self.do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (
+                            noise_pred_text - noise_pred_uncond
+                        )
 
-                # FK Steering Change
-                if fkd_args is not None and fkd_args['use_smc']:
-                    latents, current_pop_images = fkd.resample(
-                        sampling_idx=i, latents=latents, x0_preds=x0_preds
+                    if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                        noise_pred = rescale_noise_cfg(
+                            noise_pred,
+                            noise_pred_text,
+                            guidance_rescale=self.guidance_rescale,
+                        )
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents_dtype = latents.dtype
+
+                    # FK Steering Change
+                    # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    step_dict = self.scheduler.step(
+                        noise_pred, t, latents, **extra_step_kwargs, return_dict=True
                     )
+
+                    # FK Steering Change
+                    latents = step_dict['prev_sample']
+                    x0_preds = step_dict['pred_original_sample']
+                # image_latents = self.latents2img(
+                #     latents=latents,
+                #     output_type=output_type,
+                # )[0]
+                # image_latents.save(f"/home/ubuntu/tiansheng/Fk-Diffusion-Steering/text_to_image/prompt_files/ Intermediate_output/latents/{i}.png")
+                # image_x0 = self.latents2img(
+                #     latents=x0_preds,
+                #     output_type=output_type,
+                # )[0]
+                # image_x0.save(f"/home/ubuntu/tiansheng/Fk-Diffusion-Steering/text_to_image/prompt_files/ Intermediate_output/x0_preds/{i}.png")
+                # # FK Steering Change
+                # if fkd_args is not None and fkd_args['use_smc']:
+                #     latents, current_pop_images = fkd.resample(
+                #         sampling_idx=i, latents=latents, x0_preds=x0_preds
+                #     )
 
                     # if current_pop_images is not None:
                     #     images = self.image_processor.postprocess(current_pop_images, output_type=output_type)
@@ -783,34 +835,34 @@ class FKDStableDiffusionXL(
                     #         os.makedirs('./fkd_images', exist_ok=True)
                     #         image.save(f'./fkd_images/{i}_{k}.png')
 
-                if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
+                    if latents.dtype != latents_dtype:
+                        if torch.backends.mps.is_available():
+                            # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                            latents = latents.to(latents_dtype)
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop(
-                        "negative_prompt_embeds", negative_prompt_embeds
-                    )
-                    add_text_embeds = callback_outputs.pop(
-                        "add_text_embeds", add_text_embeds
-                    )
-                    negative_pooled_prompt_embeds = callback_outputs.pop(
-                        "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
-                    )
-                    add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
-                    negative_add_time_ids = callback_outputs.pop(
-                        "negative_add_time_ids", negative_add_time_ids
-                    )
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        negative_prompt_embeds = callback_outputs.pop(
+                            "negative_prompt_embeds", negative_prompt_embeds
+                        )
+                        add_text_embeds = callback_outputs.pop(
+                            "add_text_embeds", add_text_embeds
+                        )
+                        negative_pooled_prompt_embeds = callback_outputs.pop(
+                            "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
+                        )
+                        add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
+                        negative_add_time_ids = callback_outputs.pop(
+                            "negative_add_time_ids", negative_add_time_ids
+                        )
 
-                # call the callback, if provided
+                    # call the callback, if provided
                 if i == len(timesteps) - 1 or (
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
                 ):
@@ -914,6 +966,8 @@ class FKDStableDiffusionXL(
 
             image = self.image_processor.postprocess(image, output_type=output_type)
         return image
+
+
 # FK Steering Change
 def latent_to_decode(*, model, output_type, latents):
     if not output_type == "latent":
